@@ -1,0 +1,44 @@
+---
+name: Code Quality Checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.number || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  javascript-quality:
+    runs-on: ubuntu-latest
+    name: Javascript/Typescript
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Setup PNPM
+        uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run fmt --check
+      - run: pnpm run lint
+
+  yaml-quality:
+    runs-on: ubuntu-latest
+    name: YAML
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v5
+      - run: pip install yamllint==1.38.0
+      - run: yamllint -c .yamllint.yaml --format github --strict .
