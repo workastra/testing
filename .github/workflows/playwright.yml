@@ -1,27 +1,323 @@
+---
 name: Playwright Tests
+
 on:
   push:
-    branches: [ main, master ]
+    branches:
+      - v1
   pull_request:
-    branches: [ main, master ]
+    branches:
+      - v1
+  workflow_dispatch:
+    inputs:
+      platform_ref:
+        type: string
+      desk_ref:
+        type: string
+      helm_ref:
+        type: string
+      testing_ref:
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Default refs for push to main (can be overridden by PR or workflow_dispatch inputs)
+  HELM_CHART_REF: v1
+  DESK_REF: v1
+  PLATFORM_REF: v1
+  TESTING_REF: v1
+
+  # Paths and namespace
+  NAMESPACE: workastra
+  DESK_PATH: modules/desk
+  PLATFORM_PATH: modules/platform
+  HELM_PATH: modules/helm
+  TESTING_PATH: modules/testing
+
 jobs:
-  test:
+  prepare:
+    runs-on: ubuntu-latest
+    name: Prepare Refs
+    outputs:
+      helm_ref: ${{ steps.final.outputs.helm }}
+      desk_ref: ${{ steps.final.outputs.desk }}
+      platform_ref: ${{ steps.final.outputs.platform }}
+      testing_ref: ${{ steps.final.outputs.testing }}
+    steps:
+      # ===============================
+      # 1. PR Logic
+      # ===============================
+      - name: Set refs (PR)
+        if: github.event_name == 'pull_request'
+        id: set_pr
+        run: |
+          echo "helm=${{ github.event.inputs.helm_ref || env.HELM_CHART_REF }}" >> $GITHUB_OUTPUT
+          echo "desk=${{ github.event.inputs.desk_ref || env.DESK_REF }}" >> $GITHUB_OUTPUT
+          echo "platform=${{ github.event.inputs.platform_ref || env.PLATFORM_REF }}" >> $GITHUB_OUTPUT
+          echo "testing=${{ github.event.inputs.testing_ref || github.head_ref }}" >> $GITHUB_OUTPUT
+
+      # ===============================
+      # 2. Workflow Dispatch Logic
+      # ===============================
+      - name: Set refs (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        id: set_dispatch
+        run: |
+          echo "helm=${{ github.event.inputs.helm_ref || env.HELM_CHART_REF }}" >> $GITHUB_OUTPUT
+          echo "desk=${{ github.event.inputs.desk_ref || env.DESK_REF }}" >> $GITHUB_OUTPUT
+          echo "platform=${{ github.event.inputs.platform_ref || env.PLATFORM_REF }}" >> $GITHUB_OUTPUT
+          echo "testing=${{ github.event.inputs.testing_ref || env.TESTING_REF }}" >> $GITHUB_OUTPUT
+
+      # ===============================
+      # 3. Push Main Logic
+      # ===============================
+      - name: Set refs (push main)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        id: set_push
+        run: |
+          echo "helm=${{ env.HELM_CHART_REF }}" >> $GITHUB_OUTPUT
+          echo "desk=${{ env.DESK_REF }}" >> $GITHUB_OUTPUT
+          echo "platform=${{ env.PLATFORM_REF }}" >> $GITHUB_OUTPUT
+          echo "testing=${{ env.TESTING_REF }}" >> $GITHUB_OUTPUT
+
+      # ===============================
+      # 4. Consolidate Outputs
+      # ===============================
+      - name: Finalize Outputs
+        id: final
+        run: |
+          # This picks the output from whichever step actually executed
+          echo "helm=${{ steps.set_pr.outputs.helm || steps.set_dispatch.outputs.helm || steps.set_push.outputs.helm }}" >> $GITHUB_OUTPUT
+          echo "desk=${{ steps.set_pr.outputs.desk || steps.set_dispatch.outputs.desk || steps.set_push.outputs.desk }}" >> $GITHUB_OUTPUT
+          echo "platform=${{ steps.set_pr.outputs.platform || steps.set_dispatch.outputs.platform || steps.set_push.outputs.platform }}" >> $GITHUB_OUTPUT
+          echo "testing=${{ steps.set_pr.outputs.testing || steps.set_dispatch.outputs.testing || steps.set_push.outputs.testing }}" >> $GITHUB_OUTPUT
+
+      - name: Confirm Refs
+        run: |
+          echo "Using workastra/helm: ${{ steps.final.outputs.helm }}"
+          echo "Using workastra/desk: ${{ steps.final.outputs.desk }}"
+          echo "Using workastra/platform: ${{ steps.final.outputs.platform }}"
+          echo "Using workastra/testing: ${{ steps.final.outputs.testing }}"
+
+  e2e:
     timeout-minutes: 60
     runs-on: ubuntu-latest
+    name: E2E
+    needs: prepare
     steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-node@v4
-      with:
-        node-version: lts/*
-    - name: Install dependencies
-      run: npm install -g pnpm && pnpm install
-    - name: Install Playwright Browsers
-      run: pnpm exec playwright install --with-deps
-    - name: Run Playwright tests
-      run: pnpm exec playwright test
-    - uses: actions/upload-artifact@v4
-      if: ${{ !cancelled() }}
-      with:
-        name: playwright-report
-        path: playwright-report/
-        retention-days: 30
+      - name: Start minikube
+        uses: medyagh/setup-minikube@latest
+        with:
+          minikube-version: 1.38.1
+          container-runtime: containerd
+          kubernetes-version: v1.35.1
+          nodes: 1
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4.3.0
+        with:
+          version: 4.1.1
+
+      - name: Verify cluster
+        run: kubectl get pods -A
+
+      - name: Checkout workastra/desk
+        uses: actions/checkout@v6
+        with:
+          repository: workastra/desk
+          path: ${{ env.DESK_PATH }}
+          ref: ${{ needs.prepare.outputs.desk_ref }}
+
+      - name: Checkout workastra/platform
+        uses: actions/checkout@v6
+        with:
+          repository: workastra/platform
+          path: ${{ env.PLATFORM_PATH }}
+          ref: ${{ needs.prepare.outputs.platform_ref }}
+
+      - name: Checkout workastra/helm
+        uses: actions/checkout@v6
+        with:
+          repository: workastra/helm
+          path: ${{ env.HELM_PATH }}
+          ref: ${{ needs.prepare.outputs.helm_ref }}
+
+      - name: Checkout workastra/testing
+        uses: actions/checkout@v6
+        with:
+          path: ${{ env.TESTING_PATH }}
+          ref: ${{ needs.prepare.outputs.testing_ref }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # - name: Build and push image to local registry
+      #   uses: docker/build-push-action@v5
+      #   with:
+      #     context: ${{ env.PLATFORM_PATH }}
+      #     push: true
+      #     tags: ${{ steps.kind.outputs.LOCAL_REGISTRY }}/workastra-platform:latest
+
+      - name: Build and push image to local registry
+        id: build-workastra-desk
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ env.DESK_PATH }}
+          push: false
+          load: true
+          tags: workastra-desk:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Load image to minikube
+        run: minikube image load workastra-desk:latest
+
+      - name: Minikube images
+        run: minikube image ls
+
+      - name: Install Envoy Gateway
+        run: helm install eg oci://docker.io/envoyproxy/gateway-helm --version v1.7.0 -n envoy-gateway-system --create-namespace
+
+      - name: Setup Gateway API
+        run: |
+          kubectl apply -f - <<EOF
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: GatewayClass
+          metadata:
+            name: eg
+          spec:
+            controllerName: gateway.envoyproxy.io/gatewayclass-controller
+          ---
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: Gateway
+          metadata:
+            name: eg
+          spec:
+            gatewayClassName: eg
+            listeners:
+              - name: http
+                protocol: HTTP
+                port: 80
+                allowedRoutes:
+                  namespaces:
+                    from: All
+          EOF
+
+      - name: Prepare Helm values
+        working-directory: ${{ env.HELM_PATH }}/charts/workastra
+        run: |
+          tee override-values.yaml <<EOF
+          desk:
+            enabled: true
+
+            tenant:
+              scheme: http
+              domain: workastra.com
+
+            httpRoute:
+              enabled: true
+              annotations: {}
+              hostnames:
+                - workastra.com
+              parentRefs:
+                - name: eg
+                  namespace: default
+                  sectionName: http
+              rules:
+                - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /
+
+            secrets:
+              keys:
+                - $(openssl rand -base64 32 | head -c 32; echo)
+              oauth2:
+                clientSecret: secret
+          EOF
+
+      - name: Helm Template
+        working-directory: ${{ env.HELM_PATH }}/charts/workastra
+        run: |
+          helm template workastra . \
+            -n ${{ env.NAMESPACE }} \
+            -f override-values.yaml
+
+      - name: Deploy with Helm
+        working-directory: ${{ env.HELM_PATH }}/charts/workastra
+        run: |
+          helm install workastra . \
+            --namespace ${{ env.NAMESPACE }} \
+            --create-namespace \
+            -f override-values.yaml
+
+      - name: Wait for Envoy Gateway
+        run: kubectl wait --timeout=30s -n envoy-gateway-system deployment/envoy-gateway --for=condition=Available
+
+      - name: Wait for Workastra Desk
+        run: kubectl -n ${{ env.NAMESPACE }} rollout status deployment/workastra-desk --timeout=30s
+
+      - name: Allow ip and route without password
+        run: |
+          echo "$USER ALL=(ALL) NOPASSWD: /sbin/ip, /sbin/route, /usr/sbin/ip, /usr/sbin/route" | sudo tee /etc/sudoers.d/minikube
+          sudo chmod 440 /etc/sudoers.d/minikube
+
+      - name: Minikube tunnel
+        run: |
+          minikube tunnel &
+
+          echo "Waiting for LoadBalancer IP..."
+
+          # 1. Wait directly on the selector (no need to fetch service name first)
+          kubectl wait svc -n envoy-gateway-system \
+            --selector=gateway.envoyproxy.io/owning-gateway-name=eg \
+            --for=jsonpath='{.status.loadBalancer.ingress[0].ip}' \
+            --timeout=90s
+
+          # 2. Extract IP and update hosts in one go
+          EXT_IP=$(kubectl get svc -n envoy-gateway-system \
+            --selector=gateway.envoyproxy.io/owning-gateway-name=eg \
+            -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}')
+
+          echo "Updating /etc/hosts to point workastra.com to $EXT_IP"
+          echo "$EXT_IP workastra.com" | sudo tee -a /etc/hosts
+
+      - name: Setup PNPM
+        uses: pnpm/action-setup@v4
+        with:
+          package_json_file: ${{ env.TESTING_PATH }}/package.json
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: ${{ env.TESTING_PATH }}/package.json
+          cache: pnpm
+          cache-dependency-path: ${{ env.TESTING_PATH }}/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: ${{ env.TESTING_PATH }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright browsers
+        working-directory: ${{ env.TESTING_PATH }}
+        run: pnpm run playwright:install chromium-headless-shell
+
+      - name: Run Playwright tests
+        working-directory: ${{ env.TESTING_PATH }}
+        env:
+          APP_BASE_URL: http://workastra.com
+        run: pnpm run playwright:test --project=chromium
+
+      - name: Upload test report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: ${{ env.TESTING_PATH }}/playwright-report/
+          retention-days: 30
