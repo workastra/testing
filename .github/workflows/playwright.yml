@@ -4,10 +4,10 @@ name: Playwright Tests
 on:
   push:
     branches:
-      - v1
+      - v0
   pull_request:
     branches:
-      - v1
+      - v0
   workflow_dispatch:
     inputs:
       platform_ref:
@@ -23,24 +23,15 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.number || github.ref }}
   cancel-in-progress: true
 
-env:
-  # Default refs for push to main (can be overridden by PR or workflow_dispatch inputs)
-  HELM_CHART_REF: v1
-  DESK_REF: v1
-  PLATFORM_REF: v1
-  TESTING_REF: v1
-
-  # Paths and namespace
-  NAMESPACE: workastra
-  DESK_PATH: modules/desk
-  PLATFORM_PATH: modules/platform
-  HELM_PATH: modules/helm
-  TESTING_PATH: modules/testing
-
 jobs:
   prepare:
     runs-on: ubuntu-latest
     name: Prepare Refs
+    env:
+      HELM_CHART_REF: v0
+      DESK_REF: v0
+      PLATFORM_REF: v0
+      TESTING_REF: v0
     outputs:
       helm_ref: ${{ steps.final.outputs.helm }}
       desk_ref: ${{ steps.final.outputs.desk }}
@@ -74,8 +65,8 @@ jobs:
       # ===============================
       # 3. Push Main Logic
       # ===============================
-      - name: Set refs (push main)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Set refs (push)
+        if: github.event_name == 'push'
         id: set_push
         run: |
           echo "helm=${{ env.HELM_CHART_REF }}" >> $GITHUB_OUTPUT
@@ -102,11 +93,99 @@ jobs:
           echo "Using workastra/platform: ${{ steps.final.outputs.platform }}"
           echo "Using workastra/testing: ${{ steps.final.outputs.testing }}"
 
+  build-images:
+    runs-on: ubuntu-latest
+    name: Build image (${{ matrix.service }})
+    needs: [prepare]
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - service: Desk
+            repository: workastra/desk
+            path: modules/desk
+            ref: ${{ needs.prepare.outputs.desk_ref }}
+            docker:
+              repository: workastra/desk
+              file: modules/desk/Dockerfile
+          - service: Migration
+            repository: workastra/platform
+            path: modules/platform
+            ref: ${{ needs.prepare.outputs.platform_ref }}
+            docker:
+              repository: workastra/platform/migration
+              file: modules/platform/migration/jvm.Dockerfile
+    steps:
+      - name: Checkout ${{ matrix.repository }}
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ matrix.repository }}
+          path: ${{ matrix.path }}
+          ref: ${{ matrix.ref }}
+          fetch-depth: 1
+
+      - run: mkdir -p ${{ runner.temp }}/build_out
+
+      - name: Compute image metadata
+        id: meta
+        working-directory: ${{ matrix.path }}
+        run: |
+          TAG=$(git rev-parse --short HEAD)
+          SERVICE=$(echo "${{ matrix.service }}" | tr '[:upper:]' '[:lower:]')
+          SAFE_REPO=$(echo "${{ matrix.docker.repository }}" | sed 's/\//__/g')
+
+          IMAGE="${{ matrix.docker.repository }}:$TAG"
+          TARBALL="${SAFE_REPO}-${TAG}.tar"                   # Safe filename: "workastra/desk" → "workastra__desk-<sha>.tar"
+          ARTIFACT_NAME="build-${SAFE_REPO}"
+
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+
+          jq -n \
+            --arg repo  "${{ matrix.docker.repository }}" \
+            --arg tag   "$TAG" \
+            --arg image "$IMAGE" \
+            --arg tar   "$TARBALL" \
+            '{repository:$repo,tag:$tag,image:$image,tarball:$tar}' \
+            > "${{ runner.temp }}/build_out/metadata.json"
+
+      - name: Print metadata
+        run: cat ${{ runner.temp }}/build_out/metadata.json
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and export
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.path }}
+          file: ${{ matrix.docker.file }}
+          tags: ${{ steps.meta.outputs.image }}
+          outputs: type=docker,dest=${{ runner.temp }}/build_out/${{ steps.meta.outputs.tarball }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.meta.outputs.artifact_name }}
+          path: ${{ runner.temp }}/build_out/
+          retention-days: 1
+
   e2e:
     timeout-minutes: 60
     runs-on: ubuntu-latest
     name: E2E
-    needs: prepare
+    needs:
+      - prepare
+      - build-images
+    env:
+      HELM_PATH: modules/helm
+      TESTING_PATH: modules/testing
+      TENANT_NAME: workastra
+      DOMAIN: workastra.com
     steps:
       - name: Start minikube
         uses: medyagh/setup-minikube@latest
@@ -124,20 +203,6 @@ jobs:
       - name: Verify cluster
         run: kubectl get pods -A
 
-      - name: Checkout workastra/desk
-        uses: actions/checkout@v6
-        with:
-          repository: workastra/desk
-          path: ${{ env.DESK_PATH }}
-          ref: ${{ needs.prepare.outputs.desk_ref }}
-
-      - name: Checkout workastra/platform
-        uses: actions/checkout@v6
-        with:
-          repository: workastra/platform
-          path: ${{ env.PLATFORM_PATH }}
-          ref: ${{ needs.prepare.outputs.platform_ref }}
-
       - name: Checkout workastra/helm
         uses: actions/checkout@v6
         with:
@@ -151,117 +216,54 @@ jobs:
           path: ${{ env.TESTING_PATH }}
           ref: ${{ needs.prepare.outputs.testing_ref }}
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # - name: Build and push image to local registry
-      #   uses: docker/build-push-action@v5
-      #   with:
-      #     context: ${{ env.PLATFORM_PATH }}
-      #     push: true
-      #     tags: ${{ steps.kind.outputs.LOCAL_REGISTRY }}/workastra-platform:latest
-
-      - name: Build and push image to local registry
-        id: build-workastra-desk
-        uses: docker/build-push-action@v5
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
         with:
-          context: ${{ env.DESK_PATH }}
-          push: false
-          load: true
-          tags: workastra-desk:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          pattern: build-*
+          path: ${{ runner.temp }}/artifacts
+          merge-multiple: false
 
-      - name: Load image to minikube
-        run: minikube image load workastra-desk:latest
+      - name: Load images into minikube
+        id: images
+        run: |
+          while IFS= read -r -d '' meta_file; do
+            dir=$(dirname "$meta_file")
 
-      - name: Minikube images
+            read -r REPO TAG IMG TAR < <(
+              jq -r '[.repository,.tag,.image,.tarball] | @tsv' "$meta_file"
+            )
+
+            echo "Loading $IMG from $dir/$TAR …"
+            minikube image load "$dir/$TAR"
+            echo "Loaded $IMG ✓"
+
+            KEY="${REPO##*/}"
+            KEY="${KEY^^}"
+
+            echo "Exporting output keys:"
+            echo "  ${KEY}_TAG=$TAG"
+            echo "  ${KEY}_REPO=$REPO"
+
+            echo "${KEY}_TAG=$TAG"   >> "$GITHUB_OUTPUT"
+            echo "${KEY}_REPO=$REPO" >> "$GITHUB_OUTPUT"
+          done < <(find "${{ runner.temp }}/artifacts" -name "metadata.json" -print0)
+
+      - name: Verify minikube image list
         run: minikube image ls
 
-      - name: Install Envoy Gateway
-        run: helm install eg oci://docker.io/envoyproxy/gateway-helm --version v1.7.0 -n envoy-gateway-system --create-namespace
+      - name: Install Task
+        uses: go-task/setup-task@v1
 
-      - name: Setup Gateway API
-        run: |
-          kubectl apply -f - <<EOF
-          apiVersion: gateway.networking.k8s.io/v1
-          kind: GatewayClass
-          metadata:
-            name: eg
-          spec:
-            controllerName: gateway.envoyproxy.io/gatewayclass-controller
-          ---
-          apiVersion: gateway.networking.k8s.io/v1
-          kind: Gateway
-          metadata:
-            name: eg
-          spec:
-            gatewayClassName: eg
-            listeners:
-              - name: http
-                protocol: HTTP
-                port: 80
-                allowedRoutes:
-                  namespaces:
-                    from: All
-          EOF
-
-      - name: Prepare Helm values
-        working-directory: ${{ env.HELM_PATH }}/charts/workastra
-        run: |
-          tee override-values.yaml <<EOF
-          desk:
-            enabled: true
-
-            tenant:
-              scheme: http
-              domain: workastra.com
-
-            httpRoute:
-              enabled: true
-              annotations: {}
-              hostnames:
-                - workastra.com
-              parentRefs:
-                - name: eg
-                  namespace: default
-                  sectionName: http
-              rules:
-                - matches:
-                  - path:
-                      type: PathPrefix
-                      value: /
-
-            secrets:
-              keys:
-                - $(openssl rand -base64 32 | head -c 32; echo)
-              oauth2:
-                clientSecret: secret
-          EOF
-
-      - name: Helm Template
-        working-directory: ${{ env.HELM_PATH }}/charts/workastra
-        run: |
-          helm template workastra . \
-            -n ${{ env.NAMESPACE }} \
-            -f override-values.yaml
-
-      - name: Deploy with Helm
-        working-directory: ${{ env.HELM_PATH }}/charts/workastra
-        run: |
-          helm install workastra . \
-            --namespace ${{ env.NAMESPACE }} \
-            --create-namespace \
-            -f override-values.yaml
-
-      - name: Wait for Envoy Gateway
-        run: kubectl wait --timeout=30s -n envoy-gateway-system deployment/envoy-gateway --for=condition=Available
-
-      - name: Wait for Workastra Desk
-        run: kubectl -n ${{ env.NAMESPACE }} rollout status deployment/workastra-desk --timeout=30s
+      - name: Deploy environment on Minikube
+        working-directory: ${{ env.HELM_PATH }}
+        env:
+          TENANT_NAME: ${{ env.TENANT_NAME }}
+          DOMAIN: ${{ env.DOMAIN }}
+          MIGRATION_IMAGE_REPOSITORY: ${{ steps.images.outputs.MIGRATION_REPO }}
+          MIGRATION_IMAGE_TAG: ${{ steps.images.outputs.MIGRATION_TAG }}
+          DESK_IMAGE_REPOSITORY: ${{ steps.images.outputs.DESK_REPO }}
+          DESK_IMAGE_TAG: ${{ steps.images.outputs.DESK_TAG }}
+        run: task --dir .github/actions/deploy deploy
 
       - name: Allow ip and route without password
         run: |
@@ -285,8 +287,8 @@ jobs:
             --selector=gateway.envoyproxy.io/owning-gateway-name=eg \
             -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}')
 
-          echo "Updating /etc/hosts to point workastra.com to $EXT_IP"
-          echo "$EXT_IP workastra.com" | sudo tee -a /etc/hosts
+          echo "Updating /etc/hosts to point ${{ env.DOMAIN }} to $EXT_IP"
+          echo "$EXT_IP ${{ env.DOMAIN }}" | sudo tee -a /etc/hosts
 
       - name: Setup PNPM
         uses: pnpm/action-setup@v4
@@ -321,3 +323,30 @@ jobs:
           name: playwright-report
           path: ${{ env.TESTING_PATH }}/playwright-report/
           retention-days: 30
+
+  cleanup:
+    runs-on: ubuntu-latest
+    name: Cleanup
+    needs: [e2e]
+    if: ${{ !cancelled() }}
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Fetch build artifact IDs
+        run: |
+          gh api --paginate "/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
+            --jq '.artifacts[] | select(.name | startswith("build-")) | [.id, .name] | @tsv' \
+            > artifacts.tsv
+
+          echo "Found $(wc -l < artifacts.tsv) artifact(s) to delete:"
+          cat artifacts.tsv
+
+      - name: Delete build artifacts
+        run: |
+          while IFS=$'\t' read -r id name; do
+            echo "Deleting $name …"
+            gh api --method DELETE "/repos/${{ github.repository }}/actions/artifacts/$id"
+            echo "Deleted $name ✓"
+          done < artifacts.tsv
